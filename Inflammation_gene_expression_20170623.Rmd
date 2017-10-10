@@ -1,0 +1,506 @@
+---
+title: "Inflammation_gene_expression"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+# install.packages("data.table")
+# install.packages("gplots")
+# install.packages("RColorBrewer")
+# install.packages("cowplot")
+# install.packages("boot")
+
+library(data.table)
+library(cowplot)
+library(gplots)
+library(RColorBrewer)
+library(boot)
+library(knitr)
+
+rm(list=ls())
+
+source("/home/ramhak/Dropbox/PHD/PAPER I/R_v2/Function_directory/RTqPCR_data_output_adjuster.R")
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+############################################################# DATA MANIPULATIONS ########################################################
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+#1. Importing data
+DT <- fread("PaperI_RTqPCR_masterdata_resultssheet.csv")
+DT_group_injury <- fread("animal_setup.csv")
+
+#2. Merging the two dataset
+DT <- merge(DT, DT_group_injury, by.x="Sample", by.y ="RH.index")
+
+#3. Cleaning up DT
+DT <- DT[,.(Sample,Target,`Normalized Expression`,day.sacrifice, study.group, force, displacement, `Mean Cq`)]
+DT <- DT[!(Target %in% c("Actin", "GAPDH"))]
+
+#4. Adjusting numeric columns
+adjust_columns <- c("Normalized Expression", "displacement", "Mean Cq")
+DT[,adjust_columns] <- DT[,lapply(.SD, numeric_adjust), .SDcols=adjust_columns]
+
+#5. Adjusting day sacrifice
+DT[,"day.sacrifice"] <- as.character(DT[,day.sacrifice])
+DT[,"day.sacrifice"] <- do.call(rbind,lapply(as.list(DT[,day.sacrifice]),function(x){switch(x,"4"=3,"9"=10,"21"=20,"3"=3,"10"=10,"20"=20,"NA"=NA)}))
+
+#6. Removing IL1a, IL2 & IL17a due to poor data quality
+DT <- DT[!(Target %in% c("IL1a","IL17a","IL2"))]
+
+#Renaming IL12(p40) to IL12b
+DT[,"Target"] <- DT[, ifelse(Target=="IL12(p40)", "IL12b", Target)]
+
+#7. Defining factor variables
+factor_cols <- c("Target", "Sample", "study.group")
+DT[,factor_cols] <- DT[, lapply(.SD, factor), .SDcols=factor_cols]
+
+#8. Adjusting normalized expression for displacement 
+DT <- DT[, Normalized.Expression.Adjust:=`Normalized Expression`] 
+
+#9. Calculating fold change for treatment groups to no-injury control using Normalized.Expression.Adjust 
+fold_change_function <- function(target_subset){
+  target_day_subset <- split(target_subset, target_subset[, day.sacrifice])
+  norm_function <- function(x){x[,Normalized.Expression.Adjust.Fold.Change:=(Normalized.Expression.Adjust/(mean(x[study.group=="E", Normalized.Expression.Adjust], na.rm=T))-1)]}
+  out <- do.call(rbind,lapply(target_day_subset, norm_function))
+  return(out)
+}
+
+DT <- do.call(rbind,lapply(split(DT, DT[, Target]), function(x){fold_change_function(x)}))
+
+#10. Removing all observations with `Mean Cq` > 35
+DT <- DT[`Mean Cq`<=35]
+
+#11. Grouping pro - and anti-inflammatory targets
+pro_inflammation <- c("TNFa","IL1b", "IL6", "CCL2", "CCL3", "CCL4", "CCL5", "IFNg", "CXCL1", "IL12b", "IL12a", "IL3", "IL5", "GM_CSF")
+anti_inflammation <- c("IL10", "IL4", "G_CSF")
+cytokine_reduced <- c("TNFa", "IL1b", "IL6", "IL12a", "IL12b","IL10", "CXCL1")
+
+inflammation_tag_func <- function(observation){
+  if(observation %in% pro_inflammation){
+    type <- "pro"
+  } else if (observation %in% anti_inflammation){
+    type <- "anti"
+  } else {
+    type <- NA
+  }
+  return(type)
+}
+
+DT <- DT[,inflammation.profile:=sapply(as.list(DT[, Target]), function(x){inflammation_tag_func(x)})]
+DT[, "inflammation.profile"] <- factor(DT[, inflammation.profile])
+
+#12. Removing group E and F from DT and redefining factor for study.group for simplification of downstream analysis
+DT <- DT[!(study.group %in% c("E", "F"))]
+DT[, "study.group"] <- factor(DT[, study.group], levels = c("A", "B", "C", "D"))
+
+#13. Removing outliers and preserving only pro-inflamatory targets
+DT <- DT[Normalized.Expression.Adjust.Fold.Change> -5 & Normalized.Expression.Adjust.Fold.Change<5 & inflammation.profile =="pro"]
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+############################################### AGGREGATING & SUMMARISING DATA ########################################################
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+#1. Aggregating data on cytokine/chemokine level: forming biological replicates
+DT_aggregated <- unique(DT[,.(Normalized.Expression.Adjust.Fold.Change.Mean=mean(Normalized.Expression.Adjust.Fold.Change, na.rm=T),inflammation.profile), by=c("Target", "day.sacrifice", "study.group")])
+
+#2. Summarising data for plotting purposes & export
+DT_summary <- unique(DT_aggregated[,.(Normalized.Expression.Adjust.Fold.Change.Mean=mean(Normalized.Expression.Adjust.Fold.Change.Mean, na.rm=T),Normalized.Expression.Adjust.Fold.Change.SD=sd(Normalized.Expression.Adjust.Fold.Change.Mean, na.rm=T),N=.N, inflammation.profile), by=c("day.sacrifice", "study.group")])
+
+DT_summary <- DT_summary[,SEMx1.96:=qnorm(0.975)*Normalized.Expression.Adjust.Fold.Change.SD/sqrt(N)][,`:=`(CI.Lower=Normalized.Expression.Adjust.Fold.Change.Mean-SEMx1.96, CI.Upper = Normalized.Expression.Adjust.Fold.Change.Mean+SEMx1.96)]
+
+fwrite(dcast(data.table(DT_aggregated[,1:3], round(DT_aggregated[,.(Normalized.Expression.Adjust.Fold.Change.Mean)],2)), ...~day.sacrifice, value.var = "Normalized.Expression.Adjust.Fold.Change.Mean"), "expression_day_group_cytokine.csv", sep=";")
+
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+############################################################# TESTING ASSUMPTIONS ########################################################
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+#2. Testing assumption of normality
+#Performing Shaprio Wilk's test  per group and day
+normality_assumption_p <- do.call(rbind, lapply(split(DT_aggregated, DT_aggregated[, .(day.sacrifice, study.group)]), function(subset){shapiro.test(subset[,Normalized.Expression.Adjust.Fold.Change.Mean])$p.value}))
+#Creating data.table
+normality_assumption_p <- data.table(Day.Group = rownames(normality_assumption_p), P_values = normality_assumption_p)
+#Splitting out day and group into separate variables
+normality_assumption_p <- normality_assumption_p[, `:=`(Day=substr(Day.Group, 1, regexpr(".", Day.Group, fixed=T)-1), Group=substr(Day.Group,regexpr(".", Day.Group, fixed = T)+1, nchar(Day.Group)))][, !"Day.Group"]
+#Reshaping into wide format
+normality_assumption_p <- dcast(normality_assumption_p, Day~..., value.var = "P_values.V1")
+
+
+#3. Testing assumption of homogenity of variances
+#Within groups over time
+homogenity_assumption_intraGroup_p <- do.call(rbind, lapply(split(DT_aggregated, DT_aggregated[, study.group]), function(subset){fligner.test(subset[,Normalized.Expression.Adjust.Fold.Change.Mean], subset[,day.sacrifice])$p.value}))
+homogenity_assumption_intraGroup_p <- data.table(Group = rownames(homogenity_assumption_intraGroup_p), P_values = homogenity_assumption_intraGroup_p)
+
+#Between groups within each day
+homogenity_assumption_intraDay_p <- do.call(rbind, lapply(split(DT_aggregated, DT_aggregated[, day.sacrifice]), function(subset){fligner.test(subset[,Normalized.Expression.Adjust.Fold.Change.Mean], subset[,study.group])$p.value}))
+homogenity_assumption_intraDay_p <- data.table(Day = rownames(homogenity_assumption_intraDay_p), P_values = homogenity_assumption_intraDay_p)
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+############################################################# STATISTICAL ANALYSIS ########################################################
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+#1. Function for multiple group comparison between groups intraday 
+betweengroup_intraday_comparison <- function(dataset,day,statistical_method){
+  dataset <- dataset[day.sacrifice==day]
+  
+  if(statistical_method == "ANOVA"){
+    anova_p <- summary(aov(Normalized.Expression.Adjust.Fold.Change.Mean ~study.group, data=dataset))[[1]]$`Pr(>F)`[1]
+    anova_p <- format(anova_p,scientific=T, digits=2)
+    return(anova_p)
+  } else if (statistical_method=="KRUSKAL"){
+    kruskal_p <- kruskal.test(dataset[,Normalized.Expression.Adjust.Fold.Change.Mean], dataset[,study.group])$p.value
+    kruskal_p <- format(kruskal_p,scientific=T, digits=2)
+    return(kruskal_p)
+  }
+}
+
+#2. Function for multiple group comparison within group between days 
+withingroup_betweenday_comparison <- function(dataset,group,statistical_method){
+  dataset <- dataset[study.group==group]
+  
+  if(statistical_method == "ANOVA"){
+    anova_p <- summary(aov(Normalized.Expression.Adjust.Fold.Change.Mean ~day.sacrifice, data=dataset))[[1]]$`Pr(>F)`[1]
+    anova_p <- format(anova_p, scientific=T, digits=2)
+    return(anova_p)
+  } else if (statistical_method == "KRUSKAL"){
+    kruskal_p <- kruskal.test(dataset[,Normalized.Expression.Adjust.Fold.Change.Mean], dataset[,day.sacrifice])$p.value
+    kruskal_p <- format(kruskal_p, scientific=T, digits=2)
+    return(kruskal_p)
+  }
+}
+
+#3. Post hoc tests: between groups intraday
+betweengroup_intraday_posthoc <- function(dataset,day,statistical_method){
+  dataset <- dataset[day.sacrifice==day]
+  
+  if(statistical_method == "ANOVA"){
+    tukeys_p <-round(TukeyHSD(aov(Normalized.Expression.Adjust.Fold.Change.Mean ~study.group, data=dataset))[[1]][,4],2)
+    tukeys_p <- format(tukeys_p, scientific = T, digits=2)
+    tukeys_p <- data.table("p.value"=tukeys_p, group=names(tukeys_p))
+    return(tukeys_p)
+  } else if (statistical_method=="KRUSKAL"){
+    kruskal_p <- data.frame(pairwise.wilcox.test(dataset[,Normalized.Expression.Adjust.Fold.Change.Mean], dataset[,study.group])$p.value)
+    kruskal_p <- format(kruskal_p, scientific = T, digits = 2)
+    kruskal_p <- data.table(rownames(kruskal_p),kruskal_p)
+    kruskal_p <- melt(kruskal_p, id.vars = "V1")[,group:=paste(V1, variable, sep="-")][,!c("V1", "variable")]
+    kruskal_p <- kruskal_p[,.(p.value = trimws(value), group)][p.value!="NA"]
+    return(kruskal_p)
+  }
+}
+
+#4. Post hoc tests: within groups between days
+withingroup_betweenday_posthoc <- function(dataset,group,statistical_method){
+  dataset <- dataset[study.group==group]
+
+  if(statistical_method == "ANOVA"){
+    tukeys_p <-round(TukeyHSD(aov(Normalized.Expression.Adjust.Fold.Change.Mean ~ factor(day.sacrifice), data=dataset))[[1]][,4],2)
+    tukeys_p <- format(tukeys_p, scientific = T, digits=2)
+    tukeys_p <- data.table("p.value"=tukeys_p, group=names(tukeys_p))
+    return(tukeys_p)
+  } else if (statistical_method=="KRUSKAL"){
+    kruskal_p <- data.frame(pairwise.wilcox.test(dataset[,Normalized.Expression.Adjust.Fold.Change.Mean], dataset[,day.sacrifice])$p.value)
+    kruskal_p <- format(kruskal_p, scientific = T, digits = 2)
+    kruskal_p <- data.table(rownames(kruskal_p),kruskal_p)
+    kruskal_p <- melt(kruskal_p, id.vars = "V1")[,group:=paste(V1, variable, sep="-")][,!c("V1", "variable")]
+    kruskal_p <- kruskal_p[,.(p.value = trimws(value), group)][p.value!="NA"]
+    return(kruskal_p)
+  }
+}
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+############################################################# PLOT OVER TIME ########################################################
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+colorpalette_1 <- brewer.pal(11, "RdBu")[c(1,2,10,11)]
+
+time_overview_plot <- ggplot(DT_summary, aes(x=day.sacrifice, y=Normalized.Expression.Adjust.Fold.Change.Mean, color=study.group))+
+  geom_errorbar(aes(ymin=CI.Lower, ymax=CI.Upper), position = position_dodge(width=4), width=3, size=2.5)+
+  geom_point(shape=15,position = position_dodge(width=4), size=3.5)+
+  geom_jitter(DT, mapping=aes(x=day.sacrifice, y=Normalized.Expression.Adjust.Fold.Change), position = position_jitterdodge(jitter.width = 2, dodge.width=4), alpha=0.6, size=3)+
+  geom_segment(aes(x=0,xend=23, y=0, yend=0), linetype=4, size=1, alpha=0.8, color="black")+
+  geom_smooth(DT[study.group=="A" | study.group=="B"], mapping=aes(x=day.sacrifice, y=Normalized.Expression.Adjust.Fold.Change, color=study.group, fill=study.group, linetype=study.group),se=T, size=0.75,alpha=0.15, n=1000, span=0.6, show.legend = F)+
+  
+  scale_y_continuous(breaks=seq(-2,5,0.5), label=seq(-200,500,50))+
+  scale_x_continuous(breaks=seq(0,22,2))+
+  scale_color_manual(values=colorpalette_1, labels=c("Allogenic IDmBMSC (n=9)", "Syngeneic IDmBMSC (n=9)", "Medium Control (n=9)", "mSVF (n=9)"))+
+  scale_fill_manual(values=colorpalette_1, labels=c("Allogenic IDmBMSC (n=9)", "Syngeneic IDmBMSC (n=9)", "Medium Control (n=9)", "mSVF (n=9)"))+
+  scale_linetype_manual(values=c(2,3,6))+
+  
+  theme(legend.position = "bottom", legend.title = element_blank(), legend.justification = "center", axis.title = element_text(face="bold", size=22))+
+  xlab("Days (post SCI)")+
+  ylab("Relative expression (%)")+
+
+  annotate("text", x=20, y=-1.5, label="95 % CI", size=6, fontface=4, alpha=0.8)+
+  annotate("text", x=11.5, y=3.5, label="OVEREXPRESSION", fontface=2, size=7, alpha=0.3)+
+  annotate("text", x=11.5, y=-2, label="UNDEREXPRESSION", fontface=2, size=7, alpha=0.3)
+
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+######################################################## INTRADAY PLOT FUNCTION ####################################################
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+intraday_plot_function <- function(plottingdata1, plottingdata2, day, method){
+  plottingdata1 <- plottingdata1[day.sacrifice==day]
+  plottingdata2 <- plottingdata2[day.sacrifice==day]
+  
+  out_plot <- ggplot(plottingdata1, aes(x=day.sacrifice, y=Normalized.Expression.Adjust.Fold.Change.Mean, color=study.group))+
+  geom_errorbar(aes(ymin=CI.Lower, ymax=CI.Upper), position = position_dodge(width=4), width=3, size=2.5)+
+  geom_point(shape=15,position = position_dodge(width=4), size=3.5)+
+  geom_jitter(plottingdata2, mapping=aes(x=day.sacrifice, y=Normalized.Expression.Adjust.Fold.Change), position = position_jitterdodge(jitter.width = 2, dodge.width=4), alpha=0.6, size=3)+
+  geom_segment(aes(x=day-3,xend=day+3, y=0, yend=0), linetype=4, size=1, alpha=0.8, color="black")+
+
+  scale_y_continuous(breaks=seq(-1,3,0.5), labels = seq(-100,300,50))+
+  scale_color_manual(values=colorpalette_1, labels=c("Allogenic IDmBMSC (n=3)", "Syngeneic IDmBMSC (n=3)", "Medium Control (n=3)", "mSVF (n=3)"))+
+  scale_fill_manual(values=colorpalette_1, labels=c("Allogenic IDmBMSC (n=3)", "Syngeneic IDmBMSC (n=3)", "Medium Control (n=3)", "mSVF (n=3)"))+
+  scale_linetype_manual(values=c(2,3,6))+
+  
+  theme(legend.position = "bottom", legend.title = element_blank(), legend.justification = "center", legend.text = element_text(size=14),axis.title = element_text(face="bold", size=22), axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.line.x = element_blank())+
+  ylab("Relative expression (%)")+
+
+  annotate("text", x=day+2.5, y=-1.5, label="95 % CI", size=6, fontface=4, alpha=0.8)+
+  annotate("text", x=day, y=3.5, label="OVEREXPRESSION", fontface=2, size=7, alpha=0.3)+
+  annotate("text", x=day, y=-2, label="UNDEREXPRESSION", fontface=2, size=7, alpha=0.3)+
+  annotate("text", x=day, y=2.5, label=paste(method,"\n","P-Value:",betweengroup_intraday_comparison(DT_aggregated, day, method)), fontface=4, size=7, alpha=0.8)  
+  
+  if(day==10){
+    out_plot <- out_plot + geom_segment(aes(x=day-0.5, xend=day+0.5, y=1.5, yend=1.5), color="black")+annotate("text", x=day, y=1.5, label="*", size=10)
+  } else if(day==20){
+    out_plot <- out_plot + geom_segment(aes(x=day-1.5, xend=day-0.5, y=1.5, yend=1.5), color="black")+annotate("text", x=day-1, y=1.5, label="*", size=10)
+  }
+  return(out_plot)
+}
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+############################################################# HEATMAP OVER TIME ########################################################
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+#1. Heatmap for syngeneic and allogenic for all time points
+DT_heatmap_overview <-  DT_aggregated[Target %in% cytokine_reduced & study.group %in% c("A","B")][,!"inflammation.profile"]
+DT_heatmap_overview[, "study.group"] <- factor(DT_heatmap_overview[,study.group], levels=c("A","B"), labels=c("Allogenic", "Syngeneic"))
+DT_heatmap_overview <- DT_heatmap_overview[,Day.Group:=paste(study.group,day.sacrifice, sep=" d")][,!c("day.sacrifice", "study.group")]
+DT_heatmap_overview <- dcast(DT_heatmap_overview, Day.Group~..., value.var = "Normalized.Expression.Adjust.Fold.Change.Mean")
+DT_heatmap_rownames <- DT_heatmap_overview[,Day.Group]
+DT_heatmap_overview <- data.matrix(round(DT_heatmap_overview[,!"Day.Group"],2))
+rownames(DT_heatmap_overview) <- DT_heatmap_rownames
+
+#2. Function for creating heatmap data for each day separately
+heatmap_data_function <- function(baseline_data, day){
+    heatmap_data <- baseline_data[day.sacrifice==day & Target %in% cytokine_reduced, !"inflammation.profile"][,!"day.sacrifice"]
+    heatmap_data <- dcast.data.table(heatmap_data, ...~Target, value.var = "Normalized.Expression.Adjust.Fold.Change.Mean")
+    heatmap_data <- round(heatmap_data[,!"study.group"],2)
+    heatmap_data <- data.matrix(heatmap_data)
+    row_names <- c("Allogenic\nIDmBMSC", "Syngeneic\nIDmBMSC", "Medium\ncontrol", "mSVF")
+    rownames(heatmap_data) <- row_names
+    return(heatmap_data)  
+}
+
+#Heatmap function
+heatmap_plot_function <- function(heat_map_data){
+  heatmap.2(heat_map_data,
+            trace="none",
+            col=c(brewer.pal(11, "RdBu")[c(1:4)], brewer.pal(11, "RdBu")[c(8:11)]),
+            cellnote=heat_map_data,
+            notecol="white",
+            notecex=2,
+            density.info="none",
+            key=F,
+            cexRow = 1.4,
+            adjCol = c(0.5,1),
+
+            na.color = "grey",
+            
+            dendrogram="both",
+            
+            srtCol=0,
+            lhei = c(0.03, 0.3),
+            lwid= c(0.03, 0.7),
+            margins=c(7,7))
+
+}
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+###################################################### SENSITIVITY ANALYSIS ########################################################
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+#1. Subsetting boostraping data
+DT_bootstrap <- DT_aggregated[day.sacrifice==20 & study.group %in% c("A", "B")][,!c("day.sacrifice","inflammation.profile", "Target")]
+
+#2. Function for generating bootstrap replicates 
+setkey(DT_bootstrap, study.group)
+boot_data_function <- function(dataset, group, method, runs){
+  dataset <- dataset[group, Normalized.Expression.Adjust.Fold.Change.Mean] 
+  boot_data_out <- boot(dataset, function(dataset, b){method(dataset[b])}, runs)
+  return(boot_data_out)
+}
+
+#3. Generating bootstrap replicates
+bootstrap_data_allogenic <- boot_data_function(DT_bootstrap, "A", mean, 1000)
+bootstrap_data_syngeneic <- boot_data_function(DT_bootstrap, "B", mean, 1000)
+
+#4. Generating confidence intervals using the basic bootstrap method
+bootstrap_CI_allogenic <- suppressWarnings(as.numeric(boot.ci(bootstrap_data_allogenic)$basic[1,c(4,5)]))
+bootstrap_CI_syngeneic <- suppressWarnings(as.numeric(boot.ci(bootstrap_data_syngeneic)$basic[1,c(4,5)]))
+
+#5. Plotting histograms of means 
+bootstrap_data <- data.table(allogenic=bootstrap_data_allogenic$t, syngeneic=bootstrap_data_syngeneic$t)
+bootstrap_data <- suppressWarnings(melt(bootstrap_data))
+
+sensitivity_plot_means <- ggplot(bootstrap_data, aes(x=value, fill=variable))+
+  geom_rect(aes(xmin=bootstrap_CI_allogenic[1], xmax=bootstrap_CI_allogenic[2], ymin=0, ymax=500), alpha=0.02, fill="grey")+
+  geom_rect(aes(xmin=bootstrap_CI_syngeneic[1], xmax=bootstrap_CI_syngeneic[2], ymin=0, ymax=500), alpha=0.02, fill="grey")+
+  geom_histogram(bins=40, alpha=0.9)+
+
+  scale_x_continuous(breaks=seq(-0.75,1.25,0.1), labels = seq(-75,125,10))+
+  scale_y_continuous(breaks=seq(0,500,25))+
+  scale_fill_manual(values=brewer.pal(11, "RdBu")[c(1,11)], labels=c("Allogenic IDmBMSC", "Syngeneic IDmBMSC"))+
+  
+  xlab("Mean relative expression (%)")+
+  ylab("Count (n)")+
+  theme(axis.title = element_text(size=22, face="bold"), legend.position = "bottom", legend.title = element_blank(), legend.text = element_text(size=20), legend.justification = "center")+
+  
+  geom_text(aes(0.265,445),label="mu", parse=TRUE, size=8, colour="black")+
+  annotate("text", x=mean(bootstrap_data[variable=="allogenic.V1",value]), y=450, label=paste(":", toString(round(mean(bootstrap_data[variable=="allogenic.V1",value]),2)*100)), size=6, fontface=2)+
+  
+  geom_text(aes(-0.56,445),label="mu", parse=TRUE, size=8, colour="black")+
+  annotate("text", x=mean(bootstrap_data[variable=="syngeneic.V1",value]), y=450, label=paste(":", toString(round(mean(bootstrap_data[variable=="syngeneic.V1",value]),2)*100)), size=6, fontface=2)
+
+#6. Generating bootstrap replicates for p-values
+#Function
+boot_p_function <- function(dataset, method, runs){
+  dataset_allogenic <- dataset["A", Normalized.Expression.Adjust.Fold.Change.Mean]
+  dataset_syngeneic <- dataset["B", Normalized.Expression.Adjust.Fold.Change.Mean]
+  dataset <- data.table(allogenic=dataset_allogenic, syngeneic=dataset_syngeneic)
+  boot_data_p <- suppressWarnings(boot(dataset, function(dataset, b){method(dataset[b, allogenic], dataset[b,syngeneic])$p.value}, runs)$t)
+  return(boot_data_p)
+}
+
+#Function calling
+bootstrap_data_wilcoxon <- boot_p_function(DT_bootstrap, wilcox.test, 1000)
+bootstrap_data_t <- boot_p_function(DT_bootstrap, t.test, 1000)
+bootstrap_data_kolmogorov <- boot_p_function(DT_bootstrap, ks.test, 1000)
+bootstrap_data_p <- data.table(bootstrap_data_wilcoxon, bootstrap_data_t, bootstrap_data_kolmogorov)
+setnames(bootstrap_data_p, c("Wilcoxon", "T_test", "Kolmogorov")) 
+bootstrap_data_p <- suppressWarnings(melt(bootstrap_data_p, variable.name = "Method", value.name = "p.value"))
+
+#7. Plotting histograms of p-values for different tests
+sensitivity_plot_p <- ggplot(bootstrap_data_p[Method!="Kolmogorov"], aes(x=p.value, fill=Method))+
+  geom_rect(aes(xmin=0,xmax=0.05, ymin=0, ymax=350),alpha=0.02, fill="grey")+
+  geom_histogram(bins=30, position = "identity", alpha=0.7)+
+  
+  scale_x_continuous(breaks = seq(0,0.1,0.01), limits = c(0,0.1))+
+  scale_y_continuous(breaks=seq(0,350,50))+
+  scale_fill_manual(values=brewer.pal(11, "RdBu")[c(1,11)], labels=c("Mann-Whitney U-test", "Student's T-test"))+
+  
+  xlab("P-Value")+
+  ylab("Count (n)")+
+  theme(axis.title = element_text(size=22, face="bold"), legend.position = "bottom", legend.title = element_blank(), legend.justification = "center", legend.text = element_text(size=20))+
+  
+  annotate("text", x=0.025, y=250, label="Region of Statistical Significance", fontface=4, size=6)
+
+```
+
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+############################################################# OUTPUT ########################################################
+```
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+# #1. Assumptions table
+# assumption_table <- rbind(data.matrix(normality_assumption_p),data.matrix(data.table(NA,transpose(homogenity_assumption_intraGroup_p)[2])))
+# assumption_table <- data.table(cbind(assumption_table,data.matrix(rbind(data.matrix(homogenity_assumption_intraDay_p[,2]), NA))))
+# names(assumption_table) <- c("Day","Allogenic", "Syngeneic", "Cond.Medium", "mSVF", "Homo.Var.P")
+# assumption_table[,"Day"] <- c(3,10,20,"Homo.Var.P")
+# 
+# fwrite(data.table(assumption_table[,1],format(assumption_table[,2:length(assumption_table)], scientific=T, digits=2)), "assumption_table.csv", sep=";")
+
+# #2. Time overview plot
+# ggsave("inflammation_over_time.jpg", time_overview_plot, width=10, height=6, dpi=1000)
+
+# #3. Intraday plots
+# ggsave("inflammation_day3.jpg",intraday_plot_function(DT_summary, DT, 3, "ANOVA"), width=10, height = 6, dpi = 1000)
+# ggsave("inflammation_day10.jpg",intraday_plot_function(DT_summary, DT, 10, "KRUSKAL"), width=10, height = 6, dpi = 1000)
+# ggsave("inflammation_day20.jpg",intraday_plot_function(DT_summary, DT, 20, "KRUSKAL"), width=10, height = 6, dpi = 1000)
+
+# #4. Summary data
+# #Mean and CI data
+# DT_summary <- DT_summary[order(day.sacrifice,study.group)][,c("day.sacrifice","study.group","Normalized.Expression.Adjust.Fold.Change.Mean","SEMx1.96")]
+# DT_summary[,c(3,4)] <- round(DT_summary[,c(3,4)],2)
+# DT_summary <- DT_summary[, Mean.CI:=paste(Normalized.Expression.Adjust.Fold.Change.Mean, SEMx1.96, sep = "+/-")][,!c(3,4)]
+# DT_summary[,"study.group"] <- factor(DT_summary[, study.group], levels = c("A", "B", "C", "D"), labels= c("Allogenic", "Syngeneic", "Medium.Ctrl", "mSVF"))
+# names(DT_summary) <- c("Day", "Group", "Mean.CI")
+# DT_summary <- dcast(DT_summary, Day~..., value.var = "Mean.CI")
+# #P-values from multiple group comparisons
+# multi_group_column <- transpose(data.table(betweengroup_intraday_comparison(DT_aggregated, 3, "ANOVA"), betweengroup_intraday_comparison(DT_aggregated, 10, "KRUSKAL"),betweengroup_intraday_comparison(DT_aggregated, 20, "KRUSKAL"),NA))
+# multi_group_row <-  data.table("Mult.Group.P", withingroup_betweenday_comparison(DT_aggregated, "A", "ANOVA"), withingroup_betweenday_comparison(DT_aggregated, "B", "KRUSKAL"), withingroup_betweenday_comparison(DT_aggregated, "C", "ANOVA"), withingroup_betweenday_comparison(DT_aggregated, "D", "ANOVA"))
+# #Combining into export version
+# DT_summary <- rbindlist(list(DT_summary,multi_group_row))
+# DT_summary <- cbind(DT_summary, multi_group_column)
+# setnames(DT_summary, "V1", "Mult.Group.P")
+# 
+# fwrite(DT_summary,"summary_table.csv", sep=";")
+
+# #5. Post hoc test: intraday between groups
+# DT_aggregated[,"study.group"] <- factor(DT_aggregated[, study.group], levels = c("A", "B", "C", "D"), labels= c("Allogenic", "Syngeneic", "Medium.Ctrl", "mSVF"))
+# 
+# betweengroup_intraday_posthoc_table <- data.table(Comparison = betweengroup_intraday_posthoc(DT_aggregated, 3, "ANOVA")[,group], P.Value.Day3=betweengroup_intraday_posthoc(DT_aggregated, 3, "ANOVA")[,p.value], P.Value.Day10 = betweengroup_intraday_posthoc(DT_aggregated, 10, "ANOVA")[,p.value], P.Value.Day20=betweengroup_intraday_posthoc(DT_aggregated, 20, "KRUSKAL")[,p.value])
+# 
+# fwrite(betweengroup_intraday_posthoc_table, "betweengroup_intraday_posthoc_table.csv", sep=";")
+
+# #6. Post hoc test: between days within groups
+# withingroup_betweenday_posthoc_table <- data.table(Comparison=withingroup_betweenday_posthoc(DT_aggregated,"Medium.Ctrl", "ANOVA")[,group], P.Value.Allogenic = withingroup_betweenday_posthoc(DT_aggregated,"Allogenic", "ANOVA")[,p.value], P.Value.Syngeneic=withingroup_betweenday_posthoc(DT_aggregated,"Syngeneic", "KRUSKAL")[,p.value], P.Value.Medium.Ctrl = withingroup_betweenday_posthoc(DT_aggregated,"Medium.Ctrl", "ANOVA")[,p.value], P.Value.mSVF = withingroup_betweenday_posthoc(DT_aggregated,"mSVF", "ANOVA")[,p.value])
+# 
+# fwrite(withingroup_betweenday_posthoc_table, "withingroup_betweenday_posthoc_table.csv", sep=";")
+
+# #7. Saving heatmaps
+# heatmap_save_function <- function(heatmap_object, save_name){
+#   jpeg(paste(save_name,".jpg", sep=""),
+#        width=8000,
+#        height = 8000,
+#        units="px",
+#        res=1000)
+#   heatmap_plot_function(heatmap_object)
+#   dev.off()
+# }
+
+# #Creating heatmap data (*100 to convert to percentage)
+# heatmap_data_d3 <- heatmap_data_function(DT_aggregated,3)*100
+# heatmap_data_d10 <- heatmap_data_function(DT_aggregated,10)*100
+# heatmap_data_d20 <- heatmap_data_function(DT_aggregated,20)*100
+
+#Creating and saving heatmaps
+# heatmap_save_function(heatmap_data_d3, "heatmap_d3")
+# heatmap_save_function(heatmap_data_d10, "heatmap_d10")
+# heatmap_save_function(heatmap_data_d20, "heatmap_d20")
+# heatmap_save_function(DT_heatmap_overview, "DT_heatmap_overview")
+
+# #8. Saving sensitivity plot of histograms of means
+# ggsave("sensitivity_plot_means.jpg", sensitivity_plot_means, width=14, height=7, dpi=1000)
+
+# #9. Saving sensitivity plot of histograms of p-values
+# ggsave("sensitivity_plot_p.jpg", sensitivity_plot_p, width=14, height=7, dpi=1000)
+
+# #10. Exporting DT for usage in correlation analysis for fig8.
+# fwrite(DT, "DT.csv", sep = ";")
+
+```
+
