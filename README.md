@@ -15,11 +15,11 @@
 
 * *Normalisation:* Expression values were normalised to injury control for each target, animal and time point separately. Mean expression of inflammation was calculated for each animal and time point. Biological replicates were used for all statistical calculations.   
 
-* *Assumptions:* Normality was evaluated using Shapiro Wilk's test. Homogenity of varaiances was evalauted using Fligner Killeen's test.   
+* *Assumptions:* Normality was evaluated using Shapiro Wilk's test. Homogenity of variances was evaluated using Fligner Killeen's test.   
 
 * *Multiple group comparison:* One way ANOVA was used given that data was normally distributed and variances were equal. Given that data was or was not normally distributed but variances were not equal Kruskal Wallis H test was used instead.   
 
-* *Post hoc testing:* One-way ANOVA was evaluated post hoc using Tukey's post hoc test. Kruskal Wallis H test was evaluated post hoc using pair-wise Mann Whitney U tests wiht holm bonferroni correction.   
+* *Post hoc testing:* One-way ANOVA was evaluated post hoc using Tukey's post hoc test. Kruskal Wallis H test was evaluated post hoc using pair-wise Mann Whitney U tests with holm bonferroni correction.   
 
 
 
